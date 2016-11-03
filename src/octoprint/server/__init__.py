@@ -7,7 +7,7 @@ __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms
 
 import uuid
 from sockjs.tornado import SockJSRouter
-from flask import Flask, g, request, session, Blueprint
+from flask import Flask, g, request, session, Blueprint, Request, Response
 from flask.ext.login import LoginManager, current_user
 from flask.ext.principal import Principal, Permission, RoleNeed, identity_loaded, UserNeed
 from flask.ext.babel import Babel, gettext, ngettext
@@ -22,9 +22,11 @@ import logging
 import logging.config
 import atexit
 import signal
+import base64
 
 SUCCESS = {}
 NO_CONTENT = ("", 204)
+NOT_MODIFIED = ("Not Modified", 304)
 
 app = Flask("octoprint")
 assets = None
@@ -42,6 +44,7 @@ loginManager = None
 pluginManager = None
 appSessionManager = None
 pluginLifecycleManager = None
+preemptiveCache = None
 
 principals = Principal(app)
 admin_permission = Permission(RoleNeed("admin"))
@@ -61,6 +64,7 @@ import octoprint.util
 import octoprint.filemanager.storage
 import octoprint.filemanager.analysis
 import octoprint.slicing
+from octoprint.server.util.flask import PreemptiveCache
 
 from . import util
 
@@ -68,8 +72,9 @@ UI_API_KEY = ''.join('%02X' % ord(z) for z in uuid.uuid4().bytes)
 
 versions = octoprint._version.get_versions()
 VERSION = versions['version']
-BRANCH = versions['branch'] if 'branch' in versions else None
+BRANCH = versions.get('branch', None)
 DISPLAY_VERSION = "%s (%s branch)" % (VERSION, BRANCH) if BRANCH else VERSION
+REVISION = versions.get('full-revision-id', versions.get('full', None))
 del versions
 
 LOCALES = []
@@ -96,7 +101,7 @@ def load_user(id):
 	else:
 		sessionid = None
 
-	if userManager is not None:
+	if userManager.enabled:
 		if sessionid:
 			return userManager.findUser(userid=id, session=sessionid)
 		else:
@@ -107,8 +112,8 @@ def load_user(id):
 #~~ startup code
 
 
-class Server():
-	def __init__(self, configfile=None, basedir=None, host="0.0.0.0", port=5000, debug=False, allowRoot=False, logConf=None):
+class Server(object):
+	def __init__(self, configfile=None, basedir=None, host="0.0.0.0", port=5000, debug=False, allowRoot=False, logConf=None, octoprint_daemon=None):
 		self._configfile = configfile
 		self._basedir = basedir
 		self._host = host
@@ -117,12 +122,15 @@ class Server():
 		self._allowRoot = allowRoot
 		self._logConf = logConf
 		self._server = None
+		self._octoprint_daemon = octoprint_daemon
 
 		self._logger = None
 
 		self._lifecycle_callbacks = defaultdict(list)
 
 		self._template_searchpaths = []
+
+		self._intermediary_server = None
 
 	def run(self):
 		if not self._allowRoot:
@@ -142,6 +150,7 @@ class Server():
 		global pluginManager
 		global appSessionManager
 		global pluginLifecycleManager
+		global preemptiveCache
 		global debug
 
 		from tornado.ioloop import IOLoop
@@ -159,7 +168,7 @@ class Server():
 		util.flask.enable_additional_translations(additional_folders=[s.getBaseFolder("translations")])
 
 		# setup app
-		self._setup_app()
+		self._setup_app(app)
 
 		# setup i18n
 		self._setup_i18n(app)
@@ -171,6 +180,9 @@ class Server():
 			self._logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
 		sys.excepthook = exception_logger
 		self._logger.info("Starting OctoPrint %s" % DISPLAY_VERSION)
+
+		# start the intermediary server
+		self._start_intermediary_server(s)
 
 		# then initialize the plugin manager
 		pluginManager = octoprint.plugin.plugin_manager(init=True)
@@ -185,10 +197,17 @@ class Server():
 		printer = Printer(fileManager, analysisQueue, printerProfileManager)
 		appSessionManager = util.flask.AppSessionManager()
 		pluginLifecycleManager = LifecycleManager(pluginManager)
+		preemptiveCache = PreemptiveCache(os.path.join(s.getBaseFolder("data"), "preemptive_cache_config.yaml"))
+
+		# ... and initialize all plugins
 
 		def octoprint_plugin_inject_factory(name, implementation):
+			"""Factory for injections for all OctoPrintPlugins"""
+
 			if not isinstance(implementation, octoprint.plugin.OctoPrintPlugin):
+				# we only care about OctoPrintPlugins
 				return None
+
 			return dict(
 				plugin_manager=pluginManager,
 				printer_profile_manager=printerProfileManager,
@@ -199,12 +218,18 @@ class Server():
 				printer=printer,
 				app_session_manager=appSessionManager,
 				plugin_lifecycle_manager=pluginLifecycleManager,
-				data_folder=os.path.join(settings().getBaseFolder("data"), name)
+				data_folder=os.path.join(settings().getBaseFolder("data"), name),
+				preemptive_cache=preemptiveCache
 			)
 
 		def settings_plugin_inject_factory(name, implementation):
+			"""Factory for additional injections depending on plugin type"""
+
 			if not isinstance(implementation, octoprint.plugin.SettingsPlugin):
+				# we only care about SettingsPlugins
 				return None
+
+			# SettingsPlugin instnances get a PluginSettings instance injected
 			default_settings = implementation.get_settings_defaults()
 			get_preprocessors, set_preprocessors = implementation.get_settings_preprocessors()
 			plugin_settings = octoprint.plugin.plugin_settings(name,
@@ -214,6 +239,8 @@ class Server():
 			return dict(settings=plugin_settings)
 
 		def settings_plugin_config_migration_and_cleanup(name, implementation):
+			"""Take care of migrating and cleaning up any old settings"""
+
 			if not isinstance(implementation, octoprint.plugin.SettingsPlugin):
 				return
 
@@ -255,6 +282,8 @@ class Server():
 
 		# setup jinja2
 		self._setup_jinja2()
+
+		# make sure plugin lifecycle events relevant for jinja2 are taken care of
 		def template_enabled(name, plugin):
 			if plugin.implementation is None or not isinstance(plugin.implementation, octoprint.plugin.TemplatePlugin):
 				return
@@ -270,7 +299,7 @@ class Server():
 		self._setup_assets()
 
 		# configure timelapse
-		octoprint.timelapse.configureTimelapse()
+		octoprint.timelapse.configure_timelapse()
 
 		# setup command triggers
 		events.CommandTrigger(printer)
@@ -278,52 +307,33 @@ class Server():
 			events.DebugEventListener()
 
 		# setup access control
-		if s.getBoolean(["accessControl", "enabled"]):
-			userManagerName = s.get(["accessControl", "userManager"])
-			try:
-				clazz = octoprint.util.get_class(userManagerName)
-				userManager = clazz()
-			except AttributeError, e:
-				self._logger.exception("Could not instantiate user manager %s, will run with accessControl disabled!" % userManagerName)
+		userManagerName = s.get(["accessControl", "userManager"])
+		try:
+			clazz = octoprint.util.get_class(userManagerName)
+			userManager = clazz()
+		except AttributeError as e:
+			self._logger.exception("Could not instantiate user manager {}, falling back to FilebasedUserManager!".format(userManagerName))
+			userManager = octoprint.users.FilebasedUserManager()
+		finally:
+			userManager.enabled = s.getBoolean(["accessControl", "enabled"])
 
-		app.wsgi_app = util.ReverseProxied(
-			app.wsgi_app,
-			s.get(["server", "reverseProxy", "prefixHeader"]),
-			s.get(["server", "reverseProxy", "schemeHeader"]),
-			s.get(["server", "reverseProxy", "hostHeader"]),
-			s.get(["server", "reverseProxy", "prefixFallback"]),
-			s.get(["server", "reverseProxy", "schemeFallback"]),
-			s.get(["server", "reverseProxy", "hostFallback"])
-		)
-
-		secret_key = s.get(["server", "secretKey"])
-		if not secret_key:
-			import string
-			from random import choice
-			chars = string.ascii_lowercase + string.ascii_uppercase + string.digits
-			secret_key = "".join(choice(chars) for _ in xrange(32))
-			s.set(["server", "secretKey"], secret_key)
-			s.save()
-		app.secret_key = secret_key
 		loginManager = LoginManager()
 		loginManager.session_protection = "strong"
 		loginManager.user_callback = load_user
-		if userManager is None:
+		if not userManager.enabled:
 			loginManager.anonymous_user = users.DummyUser
 			principals.identity_loaders.appendleft(users.dummy_identity_loader)
 		loginManager.init_app(app)
-
-		if self._host is None:
-			self._host = s.get(["server", "host"])
-		if self._port is None:
-			self._port = s.getInt(["server", "port"])
-
-		app.debug = self._debug
 
 		# register API blueprint
 		self._setup_blueprints()
 
 		## Tornado initialization starts here
+
+		if self._host is None:
+			self._host = s.get(["server", "host"])
+		if self._port is None:
+			self._port = s.getInt(["server", "port"])
 
 		ioloop = IOLoop()
 		ioloop.install()
@@ -341,7 +351,7 @@ class Server():
 			allow_client_caching=False
 		)
 		additional_mime_types=dict(mime_type_guesser=mime_type_guesser)
-		admin_validator = dict(access_validation=util.tornado.access_validation_factory(app, loginManager, util.flask.user_validator))
+		admin_validator = dict(access_validation=util.tornado.access_validation_factory(app, loginManager, util.flask.admin_validator))
 		no_hidden_files_validator = dict(path_validation=util.tornado.path_validation_factory(lambda path: not octoprint.util.is_hidden_path(path), status_code=404))
 
 		def joined_dict(*dicts):
@@ -355,14 +365,19 @@ class Server():
 
 		server_routes = self._router.urls + [
 			# various downloads
-			(r"/downloads/timelapse/([^/]*\.mpg)", util.tornado.LargeResponseHandler, joined_dict(dict(path=s.getBaseFolder("timelapse")), download_handler_kwargs, no_hidden_files_validator)),
+			(r"/downloads/timelapse/([^/]*\.mp[g4])", util.tornado.LargeResponseHandler, joined_dict(dict(path=s.getBaseFolder("timelapse")), download_handler_kwargs, no_hidden_files_validator)),
 			(r"/downloads/files/local/(.*)", util.tornado.LargeResponseHandler, joined_dict(dict(path=s.getBaseFolder("uploads")), download_handler_kwargs, no_hidden_files_validator, additional_mime_types)),
 			(r"/downloads/logs/([^/]*)", util.tornado.LargeResponseHandler, joined_dict(dict(path=s.getBaseFolder("logs")), download_handler_kwargs, admin_validator)),
 			# camera snapshot
 			(r"/downloads/camera/current", util.tornado.UrlProxyHandler, dict(url=s.get(["webcam", "snapshot"]), as_attachment=True, access_validation=util.tornado.access_validation_factory(app, loginManager, util.flask.user_validator))),
 			# generated webassets
-			(r"/static/webassets/(.*)", util.tornado.LargeResponseHandler, dict(path=os.path.join(s.getBaseFolder("generated"), "webassets")))
+			(r"/static/webassets/(.*)", util.tornado.LargeResponseHandler, dict(path=os.path.join(s.getBaseFolder("generated"), "webassets"))),
+			# online indicators - text file with "online" as content and a transparent gif
+			(r"/online.txt", util.tornado.StaticDataHandler, dict(data="online\n")),
+			(r"/online.gif", util.tornado.StaticDataHandler, dict(data=bytes(base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")), content_type="image/gif"))
 		]
+
+		# fetch additional routes from plugins
 		for name, hook in pluginManager.get_hooks("octoprint.server.http.routes").items():
 			try:
 				result = hook(list(server_routes))
@@ -414,10 +429,15 @@ class Server():
 						self._logger.debug("Adding maximum body size of {size}B for {method} requests to {route})".format(**locals()))
 						max_body_sizes.append((method, route, size))
 
+		self._stop_intermediary_server()
+
+		# initialize and bind the server
 		self._server = util.tornado.CustomHTTPServer(self._tornado_app, max_body_sizes=max_body_sizes, default_max_body_size=s.getInt(["server", "maxSize"]))
 		self._server.listen(self._port, address=self._host)
 
 		eventManager.fire(events.Events.STARTUP)
+
+		# auto connect
 		if s.getBoolean(["serial", "autoconnect"]):
 			(port, baudrate) = s.get(["serial", "port"]), s.getInt(["serial", "baudrate"])
 			printer_profile = printerProfileManager.get_default()
@@ -467,6 +487,10 @@ class Server():
 					implementation.on_after_startup()
 				pluginLifecycleManager.add_callback("enabled", call_on_after_startup)
 
+				# when we are through with that we also run our preemptive cache
+				if settings().getBoolean(["devel", "cache", "preemptive"]):
+					self._execute_preemptive_flask_caching(preemptiveCache)
+
 			import threading
 			threading.Thread(target=work).start()
 		ioloop.add_callback(on_after_startup)
@@ -480,6 +504,11 @@ class Server():
 			observer.join()
 			octoprint.plugin.call_plugin(octoprint.plugin.ShutdownPlugin,
 			                             "on_shutdown")
+
+			if self._octoprint_daemon is not None:
+				self._logger.info("Cleaning up daemon pidfile")
+				self._octoprint_daemon.terminated()
+
 			self._logger.info("Goodbye!")
 		atexit.register(on_shutdown)
 
@@ -501,7 +530,8 @@ class Server():
 
 	def _create_socket_connection(self, session):
 		global printer, fileManager, analysisQueue, userManager, eventManager
-		return util.sockjs.PrinterStateConnection(printer, fileManager, analysisQueue, userManager, eventManager, pluginManager, session)
+		return util.sockjs.PrinterStateConnection(printer, fileManager, analysisQueue, userManager,
+		                                          eventManager, pluginManager, session)
 
 	def _check_for_root(self):
 		if "geteuid" in dir(os) and os.geteuid() == 0:
@@ -513,7 +543,7 @@ class Server():
 		if "l10n" in request.values:
 			return Locale.negotiate([request.values["l10n"]], LANGUAGES)
 
-		if hasattr(g, "identity") and g.identity and userManager is not None:
+		if hasattr(g, "identity") and g.identity and userManager.enabled:
 			userid = g.identity.id
 			try:
 				user_language = userManager.getUserSetting(userid, ("interface", "language"))
@@ -526,7 +556,7 @@ class Server():
 		if default_language is not None and not default_language == "_default" and default_language in LANGUAGES:
 			return Locale.negotiate([default_language], LANGUAGES)
 
-		return request.accept_languages.best_match(LANGUAGES)
+		return Locale.parse(request.accept_languages.best_match(LANGUAGES))
 
 	def _setup_logging(self, debug, logConf=None):
 		defaultConfig = {
@@ -605,7 +635,41 @@ class Server():
 			logging.getLogger("SERIAL").setLevel(logging.DEBUG)
 			logging.getLogger("SERIAL").debug("Enabling serial logging")
 
-	def _setup_app(self):
+	def _setup_app(self, app):
+		from octoprint.server.util.flask import ReverseProxiedEnvironment, OctoPrintFlaskRequest, OctoPrintFlaskResponse
+
+		s = settings()
+
+		app.debug = self._debug
+
+		secret_key = s.get(["server", "secretKey"])
+		if not secret_key:
+			import string
+			from random import choice
+			chars = string.ascii_lowercase + string.ascii_uppercase + string.digits
+			secret_key = "".join(choice(chars) for _ in range(32))
+			s.set(["server", "secretKey"], secret_key)
+			s.save()
+
+		app.secret_key = secret_key
+
+		reverse_proxied = ReverseProxiedEnvironment(
+			header_prefix=s.get(["server", "reverseProxy", "prefixHeader"]),
+			header_scheme=s.get(["server", "reverseProxy", "schemeHeader"]),
+			header_host=s.get(["server", "reverseProxy", "hostHeader"]),
+			header_server=s.get(["server", "reverseProxy", "serverHeader"]),
+			header_port=s.get(["server", "reverseProxy", "portHeader"]),
+			prefix=s.get(["server", "reverseProxy", "prefixFallback"]),
+			scheme=s.get(["server", "reverseProxy", "schemeFallback"]),
+			host=s.get(["server", "reverseProxy", "hostFallback"]),
+			server=s.get(["server", "reverseProxy", "serverFallback"]),
+			port=s.get(["server", "reverseProxy", "portFallback"])
+		)
+
+		OctoPrintFlaskRequest.environment_wrapper = reverse_proxied
+		app.request_class = OctoPrintFlaskRequest
+		app.response_class = OctoPrintFlaskResponse
+
 		@app.before_request
 		def before_request():
 			g.locale = self._get_locale()
@@ -617,6 +681,9 @@ class Server():
 				response.cache_control.no_cache = True
 			response.headers.add("X-Clacks-Overhead", "GNU Terry Pratchett")
 			return response
+
+		from octoprint.util.jinja import MarkdownFilter
+		MarkdownFilter(app)
 
 	def _setup_i18n(self, app):
 		global babel
@@ -645,7 +712,56 @@ class Server():
 			return self._get_locale()
 
 	def _setup_jinja2(self):
+		import re
+
 		app.jinja_env.add_extension("jinja2.ext.do")
+		app.jinja_env.add_extension("octoprint.util.jinja.trycatch")
+
+		def regex_replace(s, find, replace):
+			return re.sub(find, replace, s)
+
+		html_header_regex = re.compile("<h(?P<number>[1-6])>(?P<content>.*?)</h(?P=number)>")
+		def offset_html_headers(s, offset):
+			def repl(match):
+				number = int(match.group("number"))
+				number += offset
+				if number > 6:
+					number = 6
+				elif number < 1:
+					number = 1
+				return "<h{number}>{content}</h{number}>".format(number=number, content=match.group("content"))
+			return html_header_regex.sub(repl, s)
+
+		markdown_header_regex = re.compile("^(?P<hashs>#+)\s+(?P<content>.*)$", flags=re.MULTILINE)
+		def offset_markdown_headers(s, offset):
+			def repl(match):
+				number = len(match.group("hashs"))
+				number += offset
+				if number > 6:
+					number = 6
+				elif number < 1:
+					number = 1
+				return "{hashs} {content}".format(hashs="#" * number, content=match.group("content"))
+			return markdown_header_regex.sub(repl, s)
+
+		html_link_regex = re.compile("<(?P<tag>a.*?)>(?P<content>.*?)</a>")
+		def externalize_links(text):
+			def repl(match):
+				tag = match.group("tag")
+				if not u"href" in tag:
+					return match.group(0)
+
+				if not u"target=" in tag and not u"rel=" in tag:
+					tag += u" target=\"_blank\" rel=\"noreferrer noopener\""
+
+				content = match.group("content")
+				return u"<{tag}>{content}</a>".format(tag=tag, content=content)
+			return html_link_regex.sub(repl, text)
+
+		app.jinja_env.filters["regex_replace"] = regex_replace
+		app.jinja_env.filters["offset_html_headers"] = offset_html_headers
+		app.jinja_env.filters["offset_markdown_headers"] = offset_markdown_headers
+		app.jinja_env.filters["externalize_links"] = externalize_links
 
 		# configure additional template folders for jinja2
 		import jinja2
@@ -654,14 +770,78 @@ class Server():
 		                                                                  path_filter=lambda x: not octoprint.util.is_hidden_path(x))
 		filesystem_loader.searchpath = self._template_searchpaths
 
-		jinja_loader = jinja2.ChoiceLoader([
-			app.jinja_loader,
-			filesystem_loader
-		])
+		loaders = [app.jinja_loader, filesystem_loader]
+		if octoprint.util.is_running_from_source():
+			from octoprint.util.jinja import SelectedFileSystemLoader
+			root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+			allowed = ["AUTHORS.md", "CHANGELOG.md", "SUPPORTERS.md", "THIRDPARTYLICENSES.md"]
+			loaders.append(SelectedFileSystemLoader(root, allowed, prefix="_data/"))
+
+		jinja_loader = jinja2.ChoiceLoader(loaders)
 		app.jinja_loader = jinja_loader
-		del jinja2
 
 		self._register_template_plugins()
+
+	def _execute_preemptive_flask_caching(self, preemptive_cache):
+		from werkzeug.test import EnvironBuilder
+		import time
+
+		# we clean up entries from our preemptive cache settings that haven't been
+		# accessed longer than server.preemptiveCache.until days
+		preemptive_cache_timeout = settings().getInt(["server", "preemptiveCache", "until"])
+		cutoff_timestamp = time.time() - preemptive_cache_timeout * 24 * 60 * 60
+
+		def filter_current_entries(entry):
+			"""Returns True for entries younger than the cutoff date"""
+			return "_timestamp" in entry and entry["_timestamp"] > cutoff_timestamp
+
+		def filter_http_entries(entry):
+			"""Returns True for entries targeting http or https."""
+			return "base_url" in entry \
+			       and entry["base_url"] \
+			       and (entry["base_url"].startswith("http://")
+			            or entry["base_url"].startswith("https://"))
+
+		def filter_entries(entry):
+			"""Combined filter."""
+			filters = (filter_current_entries,
+			           filter_http_entries)
+			return all([f(entry) for f in filters])
+
+		# filter out all old and non-http entries
+		cache_data = preemptive_cache.clean_all_data(lambda root, entries: filter(filter_entries, entries))
+		if not cache_data:
+			return
+
+		def execute_caching():
+			for route in sorted(cache_data.keys(), key=lambda x: (x.count("/"), x)):
+				entries = reversed(sorted(cache_data[route], key=lambda x: x.get("_count", 0)))
+				for kwargs in entries:
+					plugin = kwargs.get("plugin", None)
+					additional_request_data = kwargs.get("_additional_request_data", dict())
+					kwargs = dict((k, v) for k, v in kwargs.items() if not k.startswith("_") and not k == "plugin")
+					kwargs.update(additional_request_data)
+
+					try:
+						if plugin:
+							self._logger.info("Preemptively caching {} (plugin {}) for {!r}".format(route, plugin, kwargs))
+						else:
+							self._logger.info("Preemptively caching {} for {!r}".format(route, kwargs))
+
+						headers = kwargs.get("headers", dict())
+						headers["X-Preemptive-Record"] = "no"
+						kwargs["headers"] = headers
+
+						builder = EnvironBuilder(**kwargs)
+						app(builder.get_environ(), lambda *a, **kw: None)
+					except:
+						self._logger.exception("Error while trying to preemptively cache {} for {!r}".format(route, kwargs))
+
+		# asynchronous caching
+		import threading
+		cache_thread = threading.Thread(target=execute_caching, name="Preemptive Cache Worker")
+		cache_thread.daemon = True
+		cache_thread.start()
 
 	def _register_template_plugins(self):
 		template_plugins = pluginManager.get_implementations(octoprint.plugin.TemplatePlugin)
@@ -786,7 +966,7 @@ class Server():
 						# that might be caused by the user still having the folder open somewhere, let's try again after
 						# waiting a bit
 						import time
-						for n in xrange(3):
+						for n in range(3):
 							time.sleep(0.5)
 							self._logger.debug("Creating {path}: Retry #{retry} after {time}s".format(path=path, retry=n+1, time=(n + 1)*0.5))
 							try:
@@ -843,7 +1023,7 @@ class Server():
 			"js/lib/modernizr.custom.js",
 			"js/lib/lodash.min.js",
 			"js/lib/sprintf.min.js",
-			"js/lib/knockout.js",
+			"js/lib/knockout-3.4.0.js",
 			"js/lib/knockout.mapping-latest.js",
 			"js/lib/babel.js",
 			"js/lib/avltree.js",
@@ -938,6 +1118,90 @@ class Server():
 		assets.register("css_app", css_app_bundle)
 		assets.register("less_app", all_less_bundle)
 
+	def _start_intermediary_server(self, s):
+		import BaseHTTPServer
+		import SimpleHTTPServer
+		import threading
+
+		host = self._host
+		port = self._port
+		if host is None:
+			host = s.get(["server", "host"])
+		if port is None:
+			port = s.getInt(["server", "port"])
+
+		self._logger.debug("Starting intermediary server on {}:{}".format(host, port))
+
+		class IntermediaryServerHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
+			def __init__(self, rules=None, *args, **kwargs):
+				if rules is None:
+					rules = []
+				self.rules = rules
+				SimpleHTTPServer.SimpleHTTPRequestHandler.__init__(self, *args, **kwargs)
+
+			def do_GET(self):
+				request_path = self.path
+				if "?" in request_path:
+					request_path = request_path[0:request_path.find("?")]
+
+				for rule in self.rules:
+					path, data, content_type = rule
+					if request_path == path:
+						self.send_response(200)
+						if content_type:
+							self.send_header("Content-Type", content_type)
+						self.end_headers()
+						self.wfile.write(data)
+						break
+				else:
+					self.send_response(404)
+					self.wfile.write("Not found")
+
+		base_path = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "static"))
+		rules = [
+			("/", ["intermediary.html",], "text/html"),
+			("/favicon.ico", ["img", "tentacle-20x20.png"], "image/png"),
+			("/intermediary.gif", bytes(base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")), "image/gif")
+		]
+
+		def contents(args):
+			path = os.path.join(base_path, *args)
+			if not os.path.isfile(path):
+				return ""
+
+			with open(path, "rb") as f:
+				data = f.read()
+			return data
+
+		def process(rule):
+			if len(rule) == 2:
+				path, data = rule
+				content_type = None
+			else:
+				path, data, content_type = rule
+
+			if isinstance(data, (list, tuple)):
+				data = contents(data)
+
+			return path, data, content_type
+
+		rules = map(process, filter(lambda rule: len(rule) == 2 or len(rule) == 3, rules))
+
+		self._intermediary_server = BaseHTTPServer.HTTPServer((host, port), lambda *args, **kwargs: IntermediaryServerHandler(rules, *args, **kwargs))
+
+		thread = threading.Thread(target=self._intermediary_server.serve_forever)
+		thread.daemon = True
+		thread.start()
+
+		self._logger.debug("Intermediary server started")
+
+	def _stop_intermediary_server(self):
+		if self._intermediary_server is None:
+			return
+		self._logger.debug("Shutting down intermediary server...")
+		self._intermediary_server.shutdown()
+		self._intermediary_server.server_close()
+		self._logger.debug("Intermediary server shut down")
 
 class LifecycleManager(object):
 	def __init__(self, plugin_manager):

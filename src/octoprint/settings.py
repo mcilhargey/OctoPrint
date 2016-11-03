@@ -46,7 +46,7 @@ def settings(init=False, basedir=None, configfile=None):
 	        (False, default). If this is set to True and the plugin manager has already been initialized, a :class:`ValueError`
 	        will be raised. The same will happen if the plugin manager has not yet been initialized and this is set to
 	        False.
-	    basedir (str): Path of the base directoy for all of OctoPrint's settings, log files, uploads etc. If not set
+	    basedir (str): Path of the base directory for all of OctoPrint's settings, log files, uploads etc. If not set
 	        the default will be used: ``~/.octoprint`` on Linux, ``%APPDATA%/OctoPrint`` on Windows and
 	        ``~/Library/Application Support/OctoPrint`` on MacOS.
 	    configfile (str): Path of the configuration file (``config.yaml``) to work on. If not set the default will
@@ -84,8 +84,23 @@ default_settings = {
 			"temperature": 5,
 			"sdStatus": 1
 		},
+		"maxCommunicationTimeouts": {
+			"idle": 2,
+			"printing": 5,
+			"long": 5
+		},
+		"maxWritePasses": 5,
 		"additionalPorts": [],
-		"longRunningCommands": ["G4", "G28", "G29", "G30", "G32"]
+		"longRunningCommands": ["G4", "G28", "G29", "G30", "G32", "M400", "M226"],
+		"checksumRequiringCommands": ["M110"],
+		"helloCommand": "M110 N0",
+		"disconnectOnErrors": True,
+		"ignoreErrorsFromFirmware": False,
+		"logResends": True,
+		"supportResendsWithoutOk": False,
+
+		# command specific flags
+		"triggerOkForM29": True
 	},
 	"server": {
 		"host": "0.0.0.0",
@@ -93,12 +108,16 @@ default_settings = {
 		"firstRun": True,
 		"secretKey": None,
 		"reverseProxy": {
-			"prefixHeader": "X-Script-Name",
-			"schemeHeader": "X-Scheme",
-			"hostHeader": "X-Forwarded-Host",
-			"prefixFallback": "",
-			"schemeFallback": "",
-			"hostFallback": ""
+			"prefixHeader": None,
+			"schemeHeader": None,
+			"hostHeader": None,
+			"serverHeader": None,
+			"portHeader": None,
+			"prefixFallback": None,
+			"schemeFallback": None,
+			"hostFallback": None,
+			"serverFallback": None,
+			"portFallback": None
 		},
 		"uploads": {
 			"maxSize":  1 * 1024 * 1024 * 1024, # 1GB
@@ -114,6 +133,10 @@ default_settings = {
 		"diskspace": {
 			"warning": 500 * 1024 * 1024, # 500 MB
 			"critical": 200 * 1024 * 1024, # 200 MB
+		},
+		"preemptiveCache": {
+			"exceptions": [],
+			"until": 7
 		}
 	},
 	"webcam": {
@@ -131,7 +154,8 @@ default_settings = {
 			"options": {},
 			"postRoll": 0,
 			"fps": 25
-		}
+		},
+		"cleanTmpAfterDays": 7
 	},
 	"gcodeViewer": {
 		"enabled": True,
@@ -148,6 +172,7 @@ default_settings = {
 		"sendChecksumWithUnknownCommands": False,
 		"unknownCommandsNeedAck": False,
 		"sdSupport": True,
+		"sdRelativePath": False,
 		"sdAlwaysAvailable": False,
 		"swallowOkAfterResend": True,
 		"repetierTargetTemp": False,
@@ -195,15 +220,16 @@ default_settings = {
 		"defaultLanguage": "_default",
 		"components": {
 			"order": {
-				"navbar": ["settings", "systemmenu", "login"],
+				"navbar": ["settings", "systemmenu", "login", "plugin_announcements"],
 				"sidebar": ["connection", "state", "files"],
 				"tab": ["temperature", "control", "gcodeviewer", "terminal", "timelapse"],
 				"settings": [
 					"section_printer", "serial", "printerprofiles", "temperatures", "terminalfilters", "gcodescripts",
 					"section_features", "features", "webcam", "accesscontrol", "api",
-					"section_octoprint", "server", "folders", "appearance", "logs", "plugin_pluginmanager", "plugin_softwareupdate"
+					"section_octoprint", "server", "folders", "appearance", "logs", "plugin_pluginmanager", "plugin_softwareupdate", "plugin_announcements"
 				],
 				"usersettings": ["access", "interface"],
+				"about": ["about", "supporters", "authors", "changelog", "license", "thirdparty", "plugin_pluginmanager"],
 				"generic": []
 			},
 			"disabled": {
@@ -260,10 +286,20 @@ default_settings = {
 			}
 		}
 	},
+	"estimation": {
+		"printTime": {
+			"statsWeighingUntil": 0.5,
+			"validityRange": 0.15,
+			"forceDumbFromPercent": 0.3,
+			"forceDumbAfterMin": 30,
+			"stableThreshold": 60
+		}
+	},
 	"devel": {
 		"stylesheet": "css",
 		"cache": {
-			"enabled": True
+			"enabled": True,
+			"preemptive": True
 		},
 		"webassets": {
 			"minify": False,
@@ -277,6 +313,7 @@ default_settings = {
 			"okWithLinenumber": False,
 			"numExtruders": 1,
 			"includeCurrentToolInTemps": True,
+			"includeFilenameInOpened": True,
 			"movementSpeed": {
 				"x": 6000,
 				"y": 6000,
@@ -296,7 +333,9 @@ default_settings = {
 			"commandBuffer": 4,
 			"sendWait": True,
 			"waitInterval": 1.0,
-			"supportM112": True
+			"supportM112": True,
+			"echoOnM117": True,
+			"brokenM29": True
 		}
 	}
 }
@@ -839,9 +878,9 @@ class Settings(object):
 
 		while len(path) > 1:
 			key = path.pop(0)
-			if key in config and key in defaults:
+			if key in config:
 				config = config[key]
-				defaults = defaults[key]
+				defaults = defaults.get(key, dict())
 			elif incl_defaults and key in defaults:
 				config = {}
 				defaults = defaults[key]
